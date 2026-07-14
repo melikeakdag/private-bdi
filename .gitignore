@@ -1,0 +1,10 @@
+
+data/
+outputs/
+models/HarmoniDiff/checkpoints/
+models/HarmoniDiff/demo/
+models/HarmoniDiff/visualization*/
+__pycache__/
+.ipynb_checkpoints/
+*.tif
+*.pt
