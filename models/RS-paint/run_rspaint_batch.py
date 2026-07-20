@@ -1,41 +1,36 @@
 """
-run_rspaint_single.py
-======================
-run_harmonidiff_single.py'nin RS-Paint'e UYARLANMIS hali. Ayni instance
-klasor yapisini (bg.png / mask_location.png / fg.png / meta.json) okur,
-sadece MODEL COGRISI HarmoniDiff yerine RS-Paint (Paint-by-Example tabanli
-Stable Diffusion inpainting + RemoteCLIP) olur.
+run_rspaint_batch.py
+=====================
+run_rspaint_single.py'nin TOPLU (batch) hali. --instances ile tek tek isim
+vermek yerine, --synthetic_dir altindaki TUM instance klasorlerini bulup
+sirayla isler. Model SADECE BIR KEZ yuklenir (tekil script'te de boyleydi,
+ama tekil script'i N kere cagirirsan model N kere yuklenir - bu, GPU'ya
+gereksiz tekrar yukleme yapmadan hepsini isler).
 
-ORTAK KALAN KISIMLAR (run_harmonidiff_single.py ile ayni mantik):
-  - load_instance(): bg/mask/fg/meta okuma
-  - CLI arg yapisi: --synthetic_dir, --out_dir, --instances
-  - instance basina cikti klasoru + meta.json kopyalama
+OZELLIKLER:
+  - Zaten islenmis (out_dir'da result.png'si olan) instance'lari ATLAR
+    -> Colab kopup tekrar baslatirsan kaldigin yerden devam eder (resume).
+  - Eksik dosyali (bg.png/mask_location.png/fg.png/meta.json yok) klasorleri
+    atlar, hata vermez.
+  - Her instance ayri try/except -> biri patlarsa butun batch durmaz,
+    hatalar sonunda ozetlenir.
+  - --limit ile once kucuk bir alt kumede test etmeni saglar.
+  - --shuffle ile rastgele siraya sokar (COK BUYUK setlerde ilk N'i degil
+    cesitli sahnelerden ornek gormek icin faydali).
 
-DEGISEN KISIMLAR (RS-Paint'e ozgu):
-  - enrich_meta.py alanlarina (bg_prompt/fg_prompt/lon/lat/gsd/tarih) IHTIYAC YOK.
-    RS-Paint metin/metadata kosullamasi kullanmiyor, sadece goruntu + CLIP embedding.
-  - fg.png, HarmoniDiff'teki gibi bbox boyutuna degil, RS-Paint'in bekledigi
-    224x224'e resize edilip CLIP-normalize ediliyor (ref_tensor).
-  - mask_location.png ayni "255=inpaint edilecek yer" semantigini tasiyor,
-    ama RS-Paint kodu iceride mask = 1 - mask/255 seklinde TERSINE ceviriyor
-    (bkz. generate_samples.ipynb) - bunu tekrar yapmiyoruz, olay ldm tarafinda
-    hallediliyor, sadece dogru mask_path'i veriyoruz.
-  - n_samples uretilip RemoteCLIP cosine-similarity'e gore EN IYI ornek seciliyor
-    (HarmoniDiff'te tek sonuc donuyordu).
-  - Opsiyonel SAM mask refinement adimi eklendi (--refine_mask).
-
-BU SCRIPT rs-paint REPO KOKUNDEN calistirilmali (ldm.*, segment_anything
-relative/kurulu paketler uzerinden import ediliyor):
-    cd rs-paint
-    python run_rspaint_single.py \
-        --synthetic_dir /content/drive/MyDrive/SAR/SynDataGen/outputs/synthetic_pairs \
-        --out_dir /content/drive/MyDrive/SAR/SynDataGen/outputs/rspaint_results \
-        --instances turkey-earthquake_00001030_inst0001 turkey-earthquake_00000933_inst0001
+Kullanim (rs-paint repo kokunden):
+    python run_rspaint_batch.py \
+        --synthetic_dir /content/drive/MyDrive/SynDataGen/outputs/synthetic_pairs \
+        --out_dir /content/drive/MyDrive/SynDataGen/outputs/rspaint_results \
+        --limit 20              # once 20 tanesiyle test et
+        # --limit vermezsen TUMUNU isler
 """
 import argparse
 import json
 import os
+import random
 import shutil
+import time
 
 import numpy as np
 import torch
@@ -50,7 +45,6 @@ from ldm.util import instantiate_from_config
 from ldm.models.diffusion.plms import PLMSSampler
 
 
-# --- ORTAK: run_harmonidiff_single.py'deki load_instance ile ayni ---
 def load_instance(inst_dir):
     bg = Image.open(os.path.join(inst_dir, "bg.png")).convert("RGB")
     mask = Image.open(os.path.join(inst_dir, "mask_location.png")).convert("L")
@@ -88,17 +82,14 @@ def get_tensor_clip():
 
 @torch.inference_mode()
 def rspaint_generate(model, sampler, bg_img, mask_img, ref_img, scale, ddim_steps, n_samples, device):
-    """generate_samples() (notebooks/generate_samples.ipynb) ile ayni mantik,
-    dosya yolu yerine PIL image alacak sekilde ufak degisiklik."""
     img_p = bg_img.resize((512, 512))
     image_tensor = get_tensor()(img_p).unsqueeze(0).repeat(n_samples, 1, 1, 1).to(device)
 
-    # DEGISTI: fg 224x224'e resize + CLIP-normalize (bbox boyutuna resize YOK)
     ref_p = ref_img.resize((224, 224))
     ref_tensor = get_tensor_clip()(ref_p).unsqueeze(0).repeat(n_samples, 1, 1, 1).to(device)
 
     mask = np.array(mask_img.resize((512, 512), Image.NEAREST))[None, None]
-    mask = 1 - mask.astype(np.float32) / 255.0  # 255(inpaint edilecek yer) -> 0
+    mask = 1 - mask.astype(np.float32) / 255.0
     mask[mask < 0.5] = 0
     mask[mask >= 0.5] = 1
     mask_tensor = torch.from_numpy(mask).repeat(n_samples, 1, 1, 1).to(device)
@@ -124,8 +115,6 @@ def rspaint_generate(model, sampler, bg_img, mask_img, ref_img, scale, ddim_step
 
 
 def pick_best_sample(model, samples, ref_img, device):
-    """DEGISTI: HarmoniDiff tek sonuc donuyordu, RS-Paint n_samples uretip
-    RemoteCLIP cosine-similarity'e gore en iyisini seciyor (orijinal notebook mantigi)."""
     img_preprocessor = model.cond_stage_model.preprocess
     ref_feat = model.cond_stage_model.get_visual_clip_features(
         img_preprocessor(ref_img).unsqueeze(0).to(device)
@@ -144,18 +133,14 @@ def pick_best_sample(model, samples, ref_img, device):
 
 def harmonize_one_rspaint(model, sampler, inst_dir, out_dir, scale, ddim_steps, n_samples, device):
     bg, mask, fg, meta = load_instance(inst_dir)
-    # DEGISTI: enrich_meta.py alanlari (bg_prompt/fg_prompt/lon/lat/gsd/tarih) BURADA GEREKMIYOR
 
     samples = rspaint_generate(model, sampler, bg, mask, fg, scale, ddim_steps, n_samples, device)
     best_idx, best_score = pick_best_sample(model, samples, fg, device)
     result_raw_img = Image.fromarray((samples[best_idx] * 255).astype(np.uint8)).resize(bg.size)
 
-    # --- EKLENDI: run_harmonidiff_single.py ile AYNI post-process mantigi ---
-    # RS-Paint tum 512x512 canvas'i VAE'den gecirip yeniden uretiyor, bu yuzden
-    # mask DISINDA bile SAR speckle dokusunda kucuk-ama-yaygin fark olusuyor
-    # (VAE reconstruction gurultusu). Change detection icin bu kabul edilemez:
-    # target etiketi sadece maskeli bolgeyi "degisti" diyor, bu yuzden pre/post
-    # farki da SADECE o bolgede olmali. Mask disini orijinal bg'ye geri donduruyoruz.
+    # EKLENDI: run_harmonidiff_single.py ile AYNI post-process - mask disini
+    # orijinal bg'ye geri donduruyoruz (VAE reconstruction gurultusunu change
+    # detection etiketiyle tutarli hale getirmek icin, bkz. run_rspaint_single.py)
     mask_resized = mask.resize(bg.size, resample=Image.NEAREST)
     mask_arr = (np.array(mask_resized) > 127).astype(np.float32)[..., None]
     result_arr = np.array(result_raw_img.convert("RGB")).astype(np.float32)
@@ -163,7 +148,6 @@ def harmonize_one_rspaint(model, sampler, inst_dir, out_dir, scale, ddim_steps, 
     final_arr = (mask_arr * result_arr + (1 - mask_arr) * bg_arr).astype(np.uint8)
     final_img = Image.fromarray(final_arr)
 
-    # --- ORTAK: run_harmonidiff_single.py ile ayni cikti disiplini ---
     inst_name = os.path.basename(inst_dir.rstrip("/"))
     inst_out_dir = os.path.join(out_dir, inst_name)
     os.makedirs(inst_out_dir, exist_ok=True)
@@ -173,44 +157,119 @@ def harmonize_one_rspaint(model, sampler, inst_dir, out_dir, scale, ddim_steps, 
     with open(os.path.join(inst_out_dir, "clip_similarity.txt"), "w") as f:
         f.write(f"best_sample_idx={best_idx}\nclip_cosine_similarity={best_score:.5f}\n")
 
-    print(f"OK: {inst_name} -> {inst_out_dir}/result.png (clip_sim={best_score:.4f})")
-    return inst_out_dir
+    return inst_out_dir, best_score
+
+
+def discover_instances(synthetic_dir):
+    """synthetic_dir altinda gecerli (bg/mask/fg/meta iceren) instance klasorlerini bulur."""
+    valid, skipped_incomplete = [], []
+    for name in sorted(os.listdir(synthetic_dir)):
+        inst_dir = os.path.join(synthetic_dir, name)
+        if not os.path.isdir(inst_dir):
+            continue
+        required = ["bg.png", "mask_location.png", "fg.png", "meta.json"]
+        if all(os.path.exists(os.path.join(inst_dir, r)) for r in required):
+            valid.append(name)
+        else:
+            skipped_incomplete.append(name)
+    return valid, skipped_incomplete
 
 
 def main():
     parser = argparse.ArgumentParser()
-    # --- ORTAK: run_harmonidiff_single.py ile ayni CLI arayuzu ---
     parser.add_argument("--synthetic_dir", type=str, required=True)
     parser.add_argument("--out_dir", type=str, required=True)
-    parser.add_argument("--instances", type=str, nargs="+", required=True)
-    # --- DEGISTI: RS-Paint'e ozgu argumanlar ---
     parser.add_argument("--config_path", type=str, default="configs/rs_remoteclip.yaml")
     parser.add_argument("--ckpt_path", type=str, default="checkpoints/sd_inpaint_samrs_ep74.ckpt")
-    parser.add_argument("--scale", type=float, default=8.0, help="classifier-free guidance scale")
+    parser.add_argument("--scale", type=float, default=8.0)
     parser.add_argument("--ddim_steps", type=int, default=50)
-    parser.add_argument("--n_samples", type=int, default=4, help="RemoteCLIP ile en iyisi secilecek aday sayisi")
+    parser.add_argument("--n_samples", type=int, default=4)
     parser.add_argument("--seed", type=int, default=20250110)
+    parser.add_argument("--limit", type=int, default=None,
+                         help="Sadece ilk N instance'i isle (test icin). Vermezsen TUMU islenir.")
+    parser.add_argument("--shuffle", action="store_true",
+                         help="Instance sirasini rastgele karistir (once --limit ile kucuk, cesitli bir alt kume gormek icin)")
+    parser.add_argument("--skip_existing", action="store_true", default=True,
+                         help="out_dir'da zaten result.png'si olan instance'lari atla (varsayilan: acik)")
+    parser.add_argument("--no_skip_existing", dest="skip_existing", action="store_false",
+                         help="Zaten islenmis olsa da HEPSINI YENIDEN isle")
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
     seed_everything(args.seed)
     device = 0 if torch.cuda.is_available() else "cpu"
 
+    all_instances, skipped_incomplete = discover_instances(args.synthetic_dir)
+    print(f"Bulunan gecerli instance: {len(all_instances)}")
+    if skipped_incomplete:
+        print(f"Eksik dosyali (bg/mask/fg/meta hepsi yok) atlanan klasor: {len(skipped_incomplete)}")
+
+    if args.shuffle:
+        random.seed(args.seed)
+        random.shuffle(all_instances)
+
+    todo = []
+    already_done = 0
+    for name in all_instances:
+        result_path = os.path.join(args.out_dir, name, "result.png")
+        if args.skip_existing and os.path.exists(result_path):
+            already_done += 1
+            continue
+        todo.append(name)
+
+    if already_done:
+        print(f"Daha once islenmis (atlanan): {already_done}")
+
+    if args.limit is not None:
+        todo = todo[: args.limit]
+
+    print(f"Bu calistirmada islenecek instance sayisi: {len(todo)}")
+    if not todo:
+        print("Islenecek instance yok, cikiliyor.")
+        return
+
     config = OmegaConf.load(args.config_path)
     model = load_model_from_config(config, args.ckpt_path, device)
     sampler = PLMSSampler(model)
-    print("Model hazir.")
+    print("Model hazir.\n")
 
-    for inst_name in args.instances:
+    ok_count, err_count = 0, 0
+    errors = []
+    t_start = time.time()
+
+    for i, inst_name in enumerate(todo, 1):
         inst_dir = os.path.join(args.synthetic_dir, inst_name)
-        if not os.path.isdir(inst_dir):
-            print(f"UYARI: klasor bulunamadi, atlaniyor: {inst_dir}")
-            continue
+        t0 = time.time()
         try:
-            harmonize_one_rspaint(model, sampler, inst_dir, args.out_dir,
-                                   args.scale, args.ddim_steps, args.n_samples, device)
+            inst_out_dir, score = harmonize_one_rspaint(
+                model, sampler, inst_dir, args.out_dir,
+                args.scale, args.ddim_steps, args.n_samples, device,
+            )
+            dt = time.time() - t0
+            ok_count += 1
+            print(f"[{i}/{len(todo)}] OK  {inst_name}  clip_sim={score:.4f}  ({dt:.1f}s)")
         except Exception as e:
-            print(f"HATA - {inst_name}: {e}")
+            err_count += 1
+            errors.append((inst_name, str(e)))
+            print(f"[{i}/{len(todo)}] HATA {inst_name}: {e}")
+
+        # her 10 instance'ta bir toplam ilerleme/sure tahmini goster
+        if i % 10 == 0 or i == len(todo):
+            elapsed = time.time() - t_start
+            avg = elapsed / i
+            remaining = avg * (len(todo) - i)
+            print(f"    -- ilerleme: {i}/{len(todo)}  ortalama={avg:.1f}s/instance  "
+                  f"tahmini kalan sure={remaining/60:.1f} dk")
+
+    print("\n--- Ozet ---")
+    print(f"Basarili: {ok_count}")
+    print(f"Hatali:   {err_count}")
+    if errors:
+        print("Hatali instance'lar (ilk 10):")
+        for name, msg in errors[:10]:
+            print(f"  {name}: {msg}")
+    print(f"Toplam sure: {(time.time() - t_start)/60:.1f} dk")
+    print(f"Cikti klasoru: {args.out_dir}")
 
 
 if __name__ == "__main__":
