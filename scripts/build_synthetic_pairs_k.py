@@ -218,6 +218,8 @@ def main():
     parser.add_argument("--image_size", type=int, default=512)
     parser.add_argument("--k", type=int, default=5, help="Sahne basina en fazla kac instance secilecek")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--limit_scenes", type=int, default=0,
+                         help="Test icin islenecek sahne sayisini sinirlar (0 = hepsi)")
     args = parser.parse_args()
 
     random.seed(args.seed)
@@ -245,6 +247,9 @@ def main():
     }
     scene_ids = sorted(crops_by_scene.keys())
     random.shuffle(scene_ids)
+    if args.limit_scenes > 0:
+        scene_ids = scene_ids[:args.limit_scenes]
+        print(f"UYARI: test modu - sadece {args.limit_scenes} sahne islenecek")
     print(f"Islenecek sahne sayisi: {len(scene_ids)}")
     print(f"Sahne basina hedef K: {args.k}")
 
