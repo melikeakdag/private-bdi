@@ -17,9 +17,12 @@ Onceki versiyondan (build_synthetic_pairs_k.py) farki: artik her sahne icin
             inst0012/
                 ...
 
-Secim mantigi (ayni-sahne kisitlamasi + K>1) onceki versiyonla ayni:
-sahne basina en fazla K instance, sadece o sahnenin KENDI crop'lariyla,
-greedy en-iyi-boyut-eslestirme ile secilir.
+Secim mantigi (ayni-sahne kisitlamasi + K>1): sahne basina EN UYGUN K instance
+(en az K degil, mumkun olan en iyi K eslesme), sadece o sahnenin KENDI
+crop'lariyla, scipy'nin Hungarian algoritmasi (linear_sum_assignment) ile
+GLOBAL olarak optimize edilerek secilir - greedy adim-adim secimden farkli
+olarak, tum instance-crop kombinasyonlari birlikte degerlendirilip toplam
+alan farkini minimize eden en iyi K'li kombinasyon bulunur.
 
 Kullanim:
     python build_synthetic_pairs_scene.py \
@@ -43,6 +46,7 @@ import pandas as pd
 import rasterio
 from PIL import Image
 from scipy import ndimage
+from scipy.optimize import linear_sum_assignment
 
 INTACT_VALUE = 1
 
@@ -90,37 +94,73 @@ def get_intact_instances(mask_arr, min_area):
     return instances
 
 
-def greedy_match_k(instances, crops, k):
-    remaining_instances = list(instances)
-    remaining_crops = list(crops)
+def optimal_match_k(instances, crops, k):
+    """Instance'lar ve crop'lar arasinda, TOPLAM alan farkini minimize eden
+    GLOBAL optimal atamayi bulur (scipy Hungarian algoritmasi), sonra bu
+    optimal atamadan en iyi (en dusuk farkli) K ciftini secer. Her crop
+    EN FAZLA BIR KEZ kullanilir (reuse yok)."""
+    n_inst, n_crop = len(instances), len(crops)
+    if n_inst == 0 or n_crop == 0:
+        return []
+
+    cost = np.zeros((n_inst, n_crop))
+    for i, inst in enumerate(instances):
+        for j, crop in enumerate(crops):
+            cost[i, j] = abs(crop["pixel_area"] - inst["area"])
+
+    row_idx, col_idx = linear_sum_assignment(cost)
+    pairs = [(cost[r, c], r, c) for r, c in zip(row_idx, col_idx)]
+    pairs.sort(key=lambda x: x[0])
+
     selected = []
-
-    for _ in range(k):
-        if not remaining_instances or not remaining_crops:
-            break
-        best = None
-        for i, inst in enumerate(remaining_instances):
-            for j, crop in enumerate(remaining_crops):
-                diff = abs(crop["pixel_area"] - inst["area"])
-                if best is None or diff < best[0]:
-                    best = (diff, i, j)
-        _, i, j = best
-        inst = remaining_instances.pop(i)
-        crop = remaining_crops.pop(j)
-        selected.append((inst, crop))
-
+    for _, r, c in pairs[:k]:
+        selected.append((instances[r], crops[c]))
     return selected
 
 
+def match_k_strict(instances, crops, k):
+    """K, BINA SAYISINA kadar KESIN bir hedeftir - crop kitligi mazeret degildir.
+
+    - n_target = min(k, len(instances))  -> bina sayisi fiziksel bir sinir,
+      bundan fazlasi zaten mumkun degil.
+    - Once benzersiz (reuse=1) optimal atama denenir (ayni-sahne kisitlamasi
+      icinde en iyi toplam eslesme).
+    - Eger benzersiz crop sayisi yetersiz kalip n_target'a ulasilamazsa,
+      KALAN binalar icin crop TEKRAR KULLANILARAK (reuse'a izin verilerek)
+      en yakin eslesme ile doldurulur - "hicbir sey yapmamaktan" iyidir.
+    - Sadece bina sayisi n_target'tan azsa (crop bolluk bile olsa) daha fazlasi
+      URETILEMEZ - bu fiziksel bir sinir, asilamaz.
+    """
+    n_target = min(k, len(instances))
+    if n_target == 0 or not crops:
+        return []
+
+    unique_pairs = optimal_match_k(instances, crops, n_target)
+    if len(unique_pairs) >= n_target:
+        return unique_pairs
+
+    matched_instance_ids = {inst["instance_id"] for inst, _ in unique_pairs}
+    remaining_instances = [inst for inst in instances if inst["instance_id"] not in matched_instance_ids]
+    n_missing = n_target - len(unique_pairs)
+
+    fallback_pairs = []
+    for inst in remaining_instances[:n_missing]:
+        best_crop = min(crops, key=lambda c: abs(c["pixel_area"] - inst["area"]))
+        fallback_pairs.append((inst, best_crop, True))  # True = reuse ile eklendi
+
+    result = [(inst, crop, False) for inst, crop in unique_pairs] + fallback_pairs
+    return result
+
+
 def process_scene(scene_id, masks_dir, images_dir, mask_suffix, bg_suffix,
-                   scene_crops, min_area, image_size, out_dir, k):
+                   scene_crops, min_area, image_size, out_dir, k, dry_run=False):
     mask_path = os.path.join(masks_dir, f"{scene_id}{mask_suffix}")
     bg_path = os.path.join(images_dir, f"{scene_id}{bg_suffix}")
 
     if not os.path.exists(mask_path) or not os.path.exists(bg_path):
-        return 0, "missing_file"
+        return 0, "missing_file", []
     if not scene_crops:
-        return 0, "pool_empty"
+        return 0, "pool_empty", []
 
     with rasterio.open(mask_path) as src:
         mask_arr = src.read(1)
@@ -128,13 +168,40 @@ def process_scene(scene_id, masks_dir, images_dir, mask_suffix, bg_suffix,
 
     instances = get_intact_instances(mask_arr, min_area)
     if not instances:
-        return 0, "no_intact_instances"
+        return 0, "no_intact_instances", []
 
-    selected = greedy_match_k(instances, scene_crops, k)
+    selected = match_k_strict(instances, scene_crops, k)
     if not selected:
-        return 0, "pool_empty"
+        return 0, "pool_empty", []
 
-    # --- SAHNE klasoru (tek) ---
+    H, W = mask_arr.shape
+
+    instance_summaries = []
+    for inst, crop, was_reused in selected:
+        x1, y1, x2, y2 = inst["bbox"]
+        w, h = x2 - x1, y2 - y1
+        aspect_ratio = max(w, h) / max(1, min(w, h))
+        touches_border = (x1 <= 1 or y1 <= 1 or x2 >= W - 1 or y2 >= H - 1)
+        instance_summaries.append({
+            "scene_id": scene_id,
+            "instance_id": inst["instance_id"],
+            "bbox_px": [x1, y1, x2, y2],
+            "width_px": w, "height_px": h,
+            "aspect_ratio": round(aspect_ratio, 2),
+            "touches_border": touches_border,
+            "instance_area_px": inst["area"],
+            "matched_crop_area_px": int(crop["pixel_area"]),
+            "area_diff_px": int(abs(crop["pixel_area"] - inst["area"])),
+            "damage_class": int(crop["damage_class"]),
+            "class_name": crop["class_name"],
+            "source_crop": crop["saved_crop_path"],
+            "crop_reused": was_reused,
+        })
+
+    if dry_run:
+        return len(selected), "ok", instance_summaries
+
+    # --- SAHNE klasoru (tek) - sadece dry_run degilse gercekten yaz ---
     scene_dir = os.path.join(out_dir, scene_id)
     instances_dir = os.path.join(scene_dir, "instances")
     os.makedirs(instances_dir, exist_ok=True)
@@ -143,22 +210,17 @@ def process_scene(scene_id, masks_dir, images_dir, mask_suffix, bg_suffix,
     bg_resized = bg_full.resize((image_size, image_size))
     bg_resized.save(os.path.join(scene_dir, "bg.png"))
 
-    # sahne seviyesinde TEK updated_label - tum secilenler birlikte
     updated = mask_arr.copy()
-    for inst, crop in selected:
+    for inst, crop, was_reused in selected:
         updated[inst["mask"]] = int(crop["damage_class"])
     upd_profile = mask_profile.copy()
     upd_profile.update(dtype=rasterio.uint8, count=1)
     with rasterio.open(os.path.join(scene_dir, "updated_label.tif"), "w", **upd_profile) as dst:
         dst.write(updated.astype(np.uint8), 1)
 
-    H, W = mask_arr.shape
-    instance_summaries = []
-
-    for inst, crop in selected:
+    for (inst, crop, was_reused), summary in zip(selected, instance_summaries):
         x1, y1, x2, y2 = inst["bbox"]
         w, h = x2 - x1, y2 - y1
-        damage_class = int(crop["damage_class"])
         inst_name = f"inst{inst['instance_id']:04d}"
 
         inst_dir = os.path.join(instances_dir, inst_name)
@@ -181,26 +243,26 @@ def process_scene(scene_id, masks_dir, images_dir, mask_suffix, bg_suffix,
             "instance_area_px": inst["area"],
             "matched_crop_area_px": int(crop["pixel_area"]),
             "area_diff_px": int(abs(crop["pixel_area"] - inst["area"])),
-            "damage_class": damage_class,
+            "damage_class": int(crop["damage_class"]),
             "class_name": crop["class_name"],
             "source_crop": crop["saved_crop_path"],
+            "crop_reused": was_reused,
         }
         with open(os.path.join(inst_dir, "meta.json"), "w") as f:
             json.dump(inst_meta, f, indent=2)
-
-        instance_summaries.append({"instance": inst_name, "damage_class": damage_class,
-                                    "class_name": crop["class_name"]})
 
     scene_meta = {
         "scene_id": scene_id,
         "k_requested": k,
         "k_selected": len(selected),
-        "instances": instance_summaries,
+        "instances": [{"instance": f"inst{i['instance_id']:04d}",
+                       "damage_class": i["damage_class"], "class_name": i["class_name"]}
+                      for i in instance_summaries],
     }
     with open(os.path.join(scene_dir, "meta.json"), "w") as f:
         json.dump(scene_meta, f, indent=2)
 
-    return len(selected), "ok"
+    return len(selected), "ok", instance_summaries
 
 
 def main():
@@ -217,6 +279,11 @@ def main():
     parser.add_argument("--k", type=int, default=5)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--limit_scenes", type=int, default=0)
+    parser.add_argument("--dry_run", action="store_true",
+                         help="Goruntu dosyasi URETMEDEN, sadece atama sonucunu (kac instance/crop "
+                              "bulundu, hangi siniflar) bir CSV'ye yazar. Hizli kontrol/QA icin.")
+    parser.add_argument("--dry_run_csv", type=str, default=None,
+                         help="--dry_run ile birlikte kullanilir, ozet CSV'nin kaydedilecegi yol")
     args = parser.parse_args()
 
     random.seed(args.seed)
@@ -253,16 +320,20 @@ def main():
     stats = {"ok": 0, "missing_file": 0, "no_intact_instances": 0, "pool_empty": 0, "error": 0}
     total_instances = 0
     errors = []
+    all_summaries = []  # dry_run modunda tum instance ozetlerini toplar
 
     for scene_id in scene_ids:
         try:
-            n_written, status = process_scene(
+            n_written, status, summaries = process_scene(
                 scene_id, args.masks_dir, args.images_dir,
                 args.mask_suffix, args.bg_suffix,
                 crops_by_scene[scene_id], args.min_area, args.image_size, args.out_dir, args.k,
+                dry_run=args.dry_run,
             )
             stats[status] += 1
             total_instances += n_written
+            if args.dry_run:
+                all_summaries.extend(summaries)
         except Exception as e:
             stats["error"] += 1
             errors.append((scene_id, str(e)))
@@ -275,9 +346,24 @@ def main():
         print(f"\n{len(errors)} sahnede hata (ilk 10):")
         for scene_id, msg in errors[:10]:
             print(f"  {scene_id}: {msg}")
-    print(f"\nToplam sahne klasoru (ok): {stats['ok']}")
+    print(f"\nToplam sahne (ok): {stats['ok']}")
     print(f"Toplam instance (tum sahneler): {total_instances}")
-    print(f"Cikti klasoru: {args.out_dir}")
+
+    if args.dry_run:
+        dry_df = pd.DataFrame(all_summaries)
+        csv_path = args.dry_run_csv or os.path.join(args.out_dir, "dry_run_assignments.csv")
+        dry_df.to_csv(csv_path, index=False)
+        print(f"\nDRY RUN - hicbir goruntu dosyasi yazilmadi.")
+        print(f"Atama ozeti CSV: {csv_path}")
+        if len(dry_df) > 0:
+            print(f"\nSahne basina instance sayisi dagilimi:")
+            print(dry_df.groupby("scene_id").size().value_counts().sort_index())
+            print(f"\nSuphelı (touches_border=True) instance sayisi: {dry_df['touches_border'].sum()}")
+            print(f"Yuksek aspect_ratio (>4) instance sayisi: {(dry_df['aspect_ratio'] > 4).sum()}")
+            print(f"Crop tekrar kullanilan (reuse) instance sayisi: {dry_df['crop_reused'].sum()} "
+                  f"(bina sayisi yeterliydi ama sahnenin kendi crop havuzu kifayetsiz kaldigi icin)")
+    else:
+        print(f"Cikti klasoru: {args.out_dir}")
 
 
 if __name__ == "__main__":
