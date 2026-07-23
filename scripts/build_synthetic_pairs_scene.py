@@ -137,7 +137,7 @@ def match_k_strict(instances, crops, k):
 
     unique_pairs = optimal_match_k(instances, crops, n_target)
     if len(unique_pairs) >= n_target:
-        return unique_pairs
+        return [(inst, crop, False) for inst, crop in unique_pairs]
 
     matched_instance_ids = {inst["instance_id"] for inst, _ in unique_pairs}
     remaining_instances = [inst for inst in instances if inst["instance_id"] not in matched_instance_ids]
